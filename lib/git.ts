@@ -60,6 +60,63 @@ const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
 let requestCounter = 0;
 
+// ---------------------------------------------------------------------------
+// fetch response cache (upload-pack v2 + v0)
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory cache for fetch responses. A fetch response is a pure function of the
+ * objects it sends, and git objects are content-addressed and immutable: once an
+ * object id exists, its bytes — and therefore its reachable closure — never change.
+ * The key covers every input that can change the bytes (protocol version, repo
+ * identity, wanted tip(s), haves, depth, client shallow list), so any push that
+ * moves a ref — and hence the wanted tip — is an automatic miss. No wall clock,
+ * no randomness, no I/O, no git binary. Bounded at 128 entries with FIFO
+ * eviction (Map insertion order; hits do not refresh). Cached Buffers are shared
+ * read-only: app.ts only hands the body to res.end(), never mutates it.
+ */
+const FETCH_CACHE_MAX = 128;
+const fetchCache = new Map<string, Buffer>();
+
+function fetchCacheKey(
+  version: 'v2' | 'v0',
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  depth: number | null,
+  oldShallow: readonly string[],
+): string {
+  return [
+    version,
+    repo.full_name,
+    depth === null ? '' : String(depth),
+    wants.join(','),
+    haves.join(','),
+    oldShallow.join(','),
+  ].join('\n');
+}
+
+function fetchCached(
+  version: 'v2' | 'v0',
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  depth: number | null,
+  oldShallow: readonly string[],
+  build: () => Buffer,
+): Buffer {
+  const key = fetchCacheKey(version, repo, wants, haves, depth, oldShallow);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const fresh = build();
+  fetchCache.set(key, fresh);
+  if (fetchCache.size > FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next().value;
+    if (oldest !== undefined) fetchCache.delete(oldest);
+  }
+  return fresh;
+}
+
 function headerOf(ctx: Ctx, name: string): string | undefined {
   const exact = ctx.headers.get(name);
   if (exact !== undefined) return exact;
@@ -649,6 +706,7 @@ function v2FetchResponse(
   depth: number | null,
   oldShallow: readonly string[],
 ): Buffer {
+  return fetchCached('v2', repo, wants, haves, depth, oldShallow, () => {
   const plan = planFetch(store, repo, wants, haves, depth, oldShallow);
   const acks = acksFor(store, repo, wants, haves);
   const parts: Buffer[] = [];
@@ -670,6 +728,7 @@ function v2FetchResponse(
   parts.push(sidebandPack(packForOids(repo, plan.oids)));
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
+  });
 }
 
 function v0FetchResponse(
@@ -680,6 +739,7 @@ function v0FetchResponse(
   depth: number | null,
   oldShallow: readonly string[],
 ): Buffer {
+  return fetchCached('v0', repo, wants, haves, depth, oldShallow, () => {
   const plan = planFetch(store, repo, wants, haves, depth, oldShallow);
   const acks = acksFor(store, repo, wants, haves);
   const parts: Buffer[] = [];
@@ -692,6 +752,7 @@ function v0FetchResponse(
   parts.push(sidebandPack(packForOids(repo, plan.oids)));
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
+  });
 }
 
 // ---------------------------------------------------------------------------
