@@ -145,8 +145,8 @@ function send(ctx: Ctx, status: number, body: unknown, extra?: Record<string, st
   };
 }
 
-/** Reply with an already-serialized JSON string (the cached issue view). */
-function sendRaw(ctx: Ctx, status: number, text: string, extra?: Record<string, string>): Resp {
+/** Reply with an already-serialized JSON string or Buffer (the cached issue view). */
+function sendRaw(ctx: Ctx, status: number, body: string | Buffer, extra?: Record<string, string>): Resp {
   return {
     status,
     headers: {
@@ -154,7 +154,7 @@ function sendRaw(ctx: Ctx, status: number, text: string, extra?: Record<string, 
       'x-github-request-id': requestIdOf(ctx),
       ...(extra ?? {}),
     },
-    body: text,
+    body,
   };
 }
 
@@ -396,16 +396,75 @@ function labelView(label: Label): Record<string, unknown> {
 
 // --- issues: pre-serialized view cache (the timed read workload hits GET /issues/{n}) ---
 
-const issueJsonCache = new WeakMap<Issue, { text: string; fp: string }>();
+/** One cached rendering: the JSON text and its Buffer (so app.ts never
+ * Buffer.from()s the text again per request). The trailing fields are the
+ * validity check — every mutable issue field the view renders, compared
+ * directly instead of hashed into a fingerprint string, so a cache hit
+ * copies no body text at all. */
+interface IssueJsonEntry {
+  text: string;
+  buf: Buffer;
+  state: 'open' | 'closed';
+  title: string;
+  body: string;
+  commentCount: number;
+  closedAt: string | null;
+  labelNames: string[];
+}
 
-/** Fingerprint of every mutable issue field the view renders. The cache must
- * notice mutations made through OTHER surfaces (GraphQL closeIssue/addComment
- * write the store directly and never call invalidateIssue): all timestamps
- * are the fixed trial instant, so updated_at alone cannot detect a change —
- * state/title/body/comments/closed_at/labels can. */
-function issueFingerprint(issue: Issue): string {
-  const labels = issue.labels.map((l) => (typeof l === 'string' ? l : l.name)).join(',');
-  return `${issue.state}\n${issue.title}\n${issue.body ?? ''}\n${issue.comments.length}\n${issue.closed_at ?? ''}\n${labels}`;
+const issueJsonCache = new WeakMap<Issue, IssueJsonEntry>();
+
+/** True when the cached entry still matches the issue. The cache must notice
+ * mutations made through OTHER surfaces (GraphQL closeIssue/addComment write
+ * the store directly and never call invalidateIssue): all timestamps are the
+ * fixed trial instant, so updated_at alone cannot detect a change — state /
+ * title / body / comments / closed_at / labels can, and each is compared
+ * here. Labels are immutable after creation and never reordered, so comparing
+ * the names in order detects any label change the view could render. */
+function issueEntryMatches(issue: Issue, entry: IssueJsonEntry): boolean {
+  if (entry.state !== issue.state) return false;
+  if (entry.title !== issue.title) return false;
+  if (entry.body !== issue.body) return false;
+  if (entry.commentCount !== issue.comments.length) return false;
+  if (entry.closedAt !== issue.closed_at) return false;
+  if (entry.labelNames.length !== issue.labels.length) return false;
+  for (let i = 0; i < issue.labels.length; i += 1) {
+    const label = issue.labels[i] as Label | string;
+    if (entry.labelNames[i] !== (typeof label === 'string' ? label : label.name)) return false;
+  }
+  return true;
+}
+
+function buildIssueJsonEntry(issue: Issue, repo: Repo): IssueJsonEntry {
+  const text = stringifyJson(issueView(issue, repo));
+  return {
+    text,
+    buf: Buffer.from(text, 'utf8'),
+    state: issue.state,
+    title: issue.title,
+    body: issue.body,
+    commentCount: issue.comments.length,
+    closedAt: issue.closed_at,
+    labelNames: issue.labels.map((l) => (typeof l === 'string' ? l : l.name)),
+  };
+}
+
+/** The issue's JSON text, built once and reused while the cached fields hold. */
+function issueJson(issue: Issue, repo: Repo): string {
+  const hit = issueJsonCache.get(issue);
+  if (hit !== undefined && issueEntryMatches(issue, hit)) return hit.text;
+  const entry = buildIssueJsonEntry(issue, repo);
+  issueJsonCache.set(issue, entry);
+  return entry.text;
+}
+
+/** The issue's JSON as a Buffer, built once and reused while the cached fields hold. */
+function issueBuf(issue: Issue, repo: Repo): Buffer {
+  const hit = issueJsonCache.get(issue);
+  if (hit !== undefined && issueEntryMatches(issue, hit)) return hit.buf;
+  const entry = buildIssueJsonEntry(issue, repo);
+  issueJsonCache.set(issue, entry);
+  return entry.buf;
 }
 
 function issueView(issue: Issue, repo: Repo): Record<string, unknown> {
@@ -438,16 +497,6 @@ function issueView(issue: Issue, repo: Repo): Record<string, unknown> {
     active_lock_reason: null,
     state_reason: issue.state === 'closed' ? 'completed' : null,
   };
-}
-
-/** The issue's JSON text, built once and reused while its fingerprint holds. */
-function issueJson(issue: Issue, repo: Repo): string {
-  const fp = issueFingerprint(issue);
-  const hit = issueJsonCache.get(issue);
-  if (hit !== undefined && hit.fp === fp) return hit.text;
-  const text = stringifyJson(issueView(issue, repo));
-  issueJsonCache.set(issue, { text, fp });
-  return text;
 }
 
 /** Drop a mutated issue's cached JSON so the next read rebuilds it. */
@@ -1251,7 +1300,7 @@ async function hIssues(ctx: Ctx): Promise<Resp | null> {
     if ('error' in created) {
       return fail(ctx, 422, `Validation Failed: label '${created.label}' does not exist`);
     }
-    return sendRaw(ctx, 201, issueJson(created, repo));
+    return sendRaw(ctx, 201, issueBuf(created, repo));
   }
 
   // GET list: state=open/closed/all (default open), sort=created, direction asc/desc.
@@ -1301,8 +1350,8 @@ async function hIssueOne(ctx: Ctx): Promise<Resp | null> {
   if (issue === undefined) return fail(ctx, 404, 'Not Found');
 
   if (ctx.method === 'GET') {
-    // Hot path: Map lookup + cached pre-serialized JSON, nothing else.
-    return sendRaw(ctx, 200, issueJson(issue, repo));
+    // Hot path: Map lookup + cached pre-serialized issue JSON Buffer, nothing else.
+    return sendRaw(ctx, 200, issueBuf(issue, repo));
   }
 
   // PATCH — title/body/state. (The store has no label patch; labels are not
@@ -1322,7 +1371,7 @@ async function hIssueOne(ctx: Ctx): Promise<Resp | null> {
   ctx.store.updateIssue(repo, n, patch);
   invalidateIssue(issue);
   const fresh = ctx.store.getIssue(repo, n) ?? issue;
-  return sendRaw(ctx, 200, issueJson(fresh, repo));
+  return sendRaw(ctx, 200, issueBuf(fresh, repo));
 }
 
 async function hComments(ctx: Ctx): Promise<Resp | null> {
