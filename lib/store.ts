@@ -924,12 +924,6 @@ export class Store {
 
   // ------------------------------------------------------------- issues
 
-  private syncOpenIssues(repo: Repo): void {
-    let open = 0;
-    for (const issue of repo.issues.values()) if (issue.state === 'open') open += 1;
-    repo.open_issues_count = open;
-  }
-
   createIssue(
     repo: Repo,
     opts: { title: string; body?: string; labels?: string[] },
@@ -958,7 +952,9 @@ export class Store {
       comments: [],
     };
     repo.issues.set(number, issue);
-    this.syncOpenIssues(repo);
+    // New issues are always open: keep the count O(1) instead of re-scanning
+    // every issue in the repo (a create per issue made the write workload O(n^2)).
+    repo.open_issues_count += 1;
     return issue;
   }
 
@@ -991,11 +987,15 @@ export class Store {
     if (patch.title !== undefined) issue.title = patch.title;
     if (patch.body !== undefined) issue.body = patch.body;
     if (patch.state !== undefined && patch.state !== issue.state) {
+      // The count moves only on a real open<->closed transition, so it stays
+      // exactly the number of open issues. Every state change flows through
+      // here (REST PATCH, GraphQL closeIssue); nothing mutates issue.state
+      // directly anywhere else.
+      repo.open_issues_count += patch.state === 'closed' ? -1 : 1;
       issue.state = patch.state;
       issue.closed_at = patch.state === 'closed' ? this.nowIsoStr : null;
     }
     issue.updated_at = this.nowIsoStr;
-    this.syncOpenIssues(repo);
     return issue;
   }
 
