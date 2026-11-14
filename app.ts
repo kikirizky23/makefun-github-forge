@@ -44,19 +44,98 @@ import { mcpHandlers } from './lib/mcp.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
-/** All handlers in dispatch order: git -> rest -> graphql -> mcp. First non-null wins. */
-const handlers: Handler[] = [...gitHandlers, ...restHandlers, ...graphqlHandlers, ...mcpHandlers];
+/**
+ * Lazy read-only view over Node's already-lowercase-keyed `req.headers`, standing
+ * in for the `Map<string, string>` the handlers expect. Every header access in
+ * the codebase is `.get()` (git.ts `headerOf`, rest.ts `header`, mcp.ts, and the
+ * `authed` check here), always with a lowercase name or one lowered before the
+ * call, and Node lowercases incoming header names — so lowering on lookup is
+ * exactly what the old eager Map copy did. Array values (e.g. `set-cookie`)
+ * resolve to their first element and missing/undefined values stay undefined,
+ * again exactly as the old copy did. This only avoids copying ~8 entries into
+ * a fresh Map on every request; no handler-visible value changes.
+ */
+class HeaderView {
+  private readonly raw: NodeJS.Dict<string | string[] | undefined>;
+  constructor(raw: NodeJS.Dict<string | string[] | undefined>) {
+    this.raw = raw;
+  }
+  get(name: string): string | undefined {
+    const value = this.raw[name.toLowerCase()];
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value[0];
+    return undefined;
+  }
+}
+
+/**
+ * Route-shape pre-filter: which handler groups can possibly answer this path.
+ * Groups run in the same order as before (git -> rest -> graphql -> mcp) and
+ * the first non-null Resp still wins. Each test is a SUPERSET of the group's
+ * real guards, verified against the handler modules, so a group is skipped
+ * only when it provably returns null for every method:
+ * - git: GIT_ROUTE in lib/git.ts is
+ *   /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/
+ *   on the decoded path; with no '%' in the path decoding is the identity, so
+ *   the raw segments must show <owner>/<repo>.git/<service> (3 segments) or
+ *   <owner>/<repo>.git/info/refs (4 segments). The test ignores a trailing
+ *   slash, which only makes it a superset — gitHandler itself still returns
+ *   null for that path, and no other group can match a git-shaped path unless
+ *   its own test below also fires.
+ * - rest: every handler in lib/rest.ts matches through apiSegments (an
+ *   optional leading `api/v3` stripped, then a first segment of `user`,
+ *   `users`, `repos` or `meta`) — except hRoot/hCatchAll, which match the
+ *   normPath `/api/v3` prefix. `segments()` collapses repeated slashes, so
+ *   the test splits on '/' and drops empties instead of a literal prefix
+ *   check (`/api//v3/user` really is a user route).
+ * - graphql: lib/graphql.ts answers only POST /api/graphql[/].
+ * - mcp: lib/mcp.ts answers only POST /mcp[/].
+ * Any path containing '%' runs the FULL loop: percent-decoding inside the
+ * handlers can turn it into a route shape the raw text does not show
+ * (e.g. `/%75ser`, `/o/r%2Egit/info/refs`, or a malformed escape that makes
+ * gitHandler return null), so no group may be skipped for it.
+ */
+function dispatchGroups(path: string, method: string): Handler[][] {
+  if (path.includes('%')) return [gitHandlers, restHandlers, graphqlHandlers, mcpHandlers];
+  const groups: Handler[][] = [];
+  const segs = path.split('/').filter((s) => s.length > 0);
+  if (
+    (segs.length === 3 || segs.length === 4) &&
+    segs[1] !== undefined &&
+    segs[1].length > 4 &&
+    segs[1].endsWith('.git') &&
+    ((segs.length === 3 && (segs[2] === 'git-upload-pack' || segs[2] === 'git-receive-pack')) ||
+      (segs.length === 4 && segs[2] === 'info' && segs[3] === 'refs'))
+  ) {
+    groups.push(gitHandlers);
+  }
+  // normPath (lib/rest.ts): strip one trailing slash, if any.
+  const p = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
+  let rest = p === '/api/v3' || p.startsWith('/api/v3/');
+  if (!rest) {
+    let s = segs;
+    if (s.length >= 2 && s[0] === 'api' && s[1] === 'v3') s = s.slice(2);
+    rest = s.length > 0 && (s[0] === 'user' || s[0] === 'users' || s[0] === 'repos' || s[0] === 'meta');
+  }
+  if (rest) groups.push(restHandlers);
+  if (method === 'POST' && (path === '/api/graphql' || path === '/api/graphql/')) {
+    groups.push(graphqlHandlers);
+  }
+  if (method === 'POST' && (path === '/mcp' || path === '/mcp/')) groups.push(mcpHandlers);
+  return groups;
+}
 
 /** Monotonic per-process request counter; the request id is `req-<n>`. */
 let requestCounter = 0;
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+/**
+ * Parse the request URL once; pathname and query both come from this one
+ * object. Throws on an unparseable target — the caller's catch answers 500,
+ * exactly as the old two-parse code did (`pathOf` fell back to '/', then the
+ * second parse for the query threw inside the same try).
+ */
+function parseRequestUrl(req: IncomingMessage): URL {
+  return new URL(req.url ?? '/', 'http://entry');
 }
 
 /** Read the full request body, capped at MAX_BODY_BYTES. `tooLarge` when the cap was passed. */
@@ -115,7 +194,8 @@ export function createApp(): Server {
     void (async (): Promise<void> => {
       const requestId = `req-${++requestCounter}`;
       try {
-        const path = pathOf(req);
+        const url = parseRequestUrl(req);
+        const path = url.pathname;
         const method = req.method ?? 'GET';
 
         // The env's boot check calls this twice: 200 {"ok":true}. No auth, no body read.
@@ -149,11 +229,7 @@ export function createApp(): Server {
           }
         }
 
-        const headers = new Map<string, string>();
-        for (const [key, value] of Object.entries(req.headers)) {
-          if (typeof value === 'string') headers.set(key.toLowerCase(), value);
-          else if (Array.isArray(value) && typeof value[0] === 'string') headers.set(key.toLowerCase(), value[0]);
-        }
+        const headers = new HeaderView(req.headers) as unknown as Map<string, string>;
         const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
         const authed = token !== '' && (headers.get('authorization') ?? '') === `Bearer ${token}`;
 
@@ -161,7 +237,7 @@ export function createApp(): Server {
           store,
           method,
           path,
-          query: new URL(req.url ?? '/', 'http://entry').searchParams,
+          query: url.searchParams,
           headers,
           rawBody,
           json,
@@ -172,8 +248,11 @@ export function createApp(): Server {
         };
 
         let out: Resp | null = null;
-        for (const handler of handlers) {
-          out = await handler(ctx);
+        for (const group of dispatchGroups(path, method)) {
+          for (const handler of group) {
+            out = await handler(ctx);
+            if (out !== null) break;
+          }
           if (out !== null) break;
         }
         if (out === null) out = jsonResp(404, { message: 'Not Found' });
